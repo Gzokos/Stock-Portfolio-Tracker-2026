@@ -6,7 +6,7 @@ services:
     environment:
       POSTGRES_DB: portfolio_db
       POSTGRES_USER: portfolio_user
-      POSTGRES_PASSWORD: strongpass123
+      POSTGRES_PASSWORD: uniofgreater2026!@
     ports:
       - "5432:5432"
     volumes:
