@@ -381,3 +381,15 @@ BEGIN
     WHERE cp.account_uuid = p_account_uuid;
 END;
 $$ LANGUAGE plpgsql;
+
+-- SAMPLE DATA
+
+INSERT INTO market_instruments
+(symbol_code, instrument_name, exchange_name, sector_name, industry_name, country_name, quote_currency)
+VALUES
+('AAPL', 'Apple Inc.', 'NASDAQ', 'Technology', 'Consumer Electronics', 'USA', 'USD'),
+('MSFT', 'Microsoft Corporation', 'NASDAQ', 'Technology', 'Software', 'USA', 'USD'),
+('NVDA', 'NVIDIA Corporation', 'NASDAQ', 'Technology', 'Semiconductors', 'USA', 'USD'),
+('AMZN', 'Amazon.com Inc.', 'NASDAQ', 'Consumer Discretionary', 'E-Commerce', 'USA', 'USD'),
+('TSLA', 'Tesla Inc.', 'NASDAQ', 'Consumer Discretionary', 'Automotive', 'USA', 'USD')
+ON CONFLICT (symbol_code) DO NOTHING;
