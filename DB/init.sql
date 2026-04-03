@@ -184,3 +184,200 @@ CREATE TABLE change_events (
 CREATE INDEX ix_change_events_actor_uuid ON change_events(actor_uuid);
 CREATE INDEX ix_change_events_entity_name ON change_events(entity_name);
 CREATE INDEX ix_change_events_happened_at ON change_events(happened_at DESC);
+
+-- TIMESTAMP TRIGGER FUNCTION
+
+CREATE OR REPLACE FUNCTION touch_modified_timestamp()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.modified_on = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION touch_updated_timestamp()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- tables using modified_on
+CREATE TRIGGER trg_app_users_modified
+BEFORE UPDATE ON app_users
+FOR EACH ROW
+EXECUTE FUNCTION touch_modified_timestamp();
+
+CREATE TRIGGER trg_investment_accounts_modified
+BEFORE UPDATE ON investment_accounts
+FOR EACH ROW
+EXECUTE FUNCTION touch_modified_timestamp();
+
+CREATE TRIGGER trg_market_instruments_modified
+BEFORE UPDATE ON market_instruments
+FOR EACH ROW
+EXECUTE FUNCTION touch_modified_timestamp();
+
+CREATE TRIGGER trg_current_positions_modified
+BEFORE UPDATE ON current_positions
+FOR EACH ROW
+EXECUTE FUNCTION touch_modified_timestamp();
+
+CREATE TRIGGER trg_daily_market_prices_modified
+BEFORE UPDATE ON daily_market_prices
+FOR EACH ROW
+EXECUTE FUNCTION touch_modified_timestamp();
+
+-- tables using updated_at
+CREATE TRIGGER trg_trade_ledger_updated
+BEFORE UPDATE ON trade_ledger
+FOR EACH ROW
+EXECUTE FUNCTION touch_updated_timestamp();
+
+-- VIEWS
+
+CREATE VIEW vw_account_overview AS
+SELECT
+    ia.account_uuid,
+    ia.owner_uuid,
+    ia.account_title,
+    ia.base_currency,
+    COALESCE(pos.total_positions, 0) AS total_positions,
+    COALESCE(trx.total_trades, 0) AS total_trades,
+    COALESCE(pos.total_cost_basis, 0) AS total_cost_basis,
+    COALESCE(pos.total_market_value, 0) AS total_market_value,
+    COALESCE(pos.total_unrealized_pnl, 0) AS total_unrealized_pnl,
+    CASE
+        WHEN COALESCE(pos.total_cost_basis, 0) > 0
+        THEN ROUND((pos.total_unrealized_pnl / pos.total_cost_basis) * 100, 2)
+        ELSE 0
+    END AS total_unrealized_pnl_pct
+FROM investment_accounts ia
+LEFT JOIN (
+    SELECT
+        cp.account_uuid,
+        COUNT(*) AS total_positions,
+        SUM(cp.units_held * cp.weighted_avg_cost) AS total_cost_basis,
+        SUM(cp.units_held * COALESCE(cp.latest_market_price, 0)) AS total_market_value,
+        SUM((cp.units_held * COALESCE(cp.latest_market_price, 0)) - (cp.units_held * cp.weighted_avg_cost)) AS total_unrealized_pnl
+    FROM current_positions cp
+    GROUP BY cp.account_uuid
+) pos ON ia.account_uuid = pos.account_uuid
+LEFT JOIN (
+    SELECT
+        tl.account_uuid,
+        COUNT(*) AS total_trades
+    FROM trade_ledger tl
+    GROUP BY tl.account_uuid
+) trx ON ia.account_uuid = trx.account_uuid;
+
+CREATE VIEW vw_position_details AS
+SELECT
+    cp.position_uuid,
+    cp.account_uuid,
+    mi.symbol_code,
+    mi.instrument_name,
+    mi.exchange_name,
+    mi.sector_name,
+    cp.units_held,
+    cp.weighted_avg_cost,
+    cp.latest_market_price,
+    ROUND(cp.units_held * cp.weighted_avg_cost, 2) AS cost_basis,
+    ROUND(cp.units_held * COALESCE(cp.latest_market_price, 0), 2) AS market_value,
+    ROUND((cp.units_held * COALESCE(cp.latest_market_price, 0)) - (cp.units_held * cp.weighted_avg_cost), 2) AS unrealized_pnl,
+    cp.price_refreshed_at
+FROM current_positions cp
+JOIN market_instruments mi
+  ON cp.instrument_uuid = mi.instrument_uuid;
+
+CREATE VIEW vw_trade_history AS
+SELECT
+    tl.trade_uuid,
+    tl.account_uuid,
+    mi.symbol_code,
+    mi.instrument_name,
+    tl.trade_kind,
+    tl.units,
+    tl.execution_price,
+    tl.gross_amount,
+    tl.brokerage_fee,
+    tl.tax_amount,
+    (tl.gross_amount + tl.brokerage_fee + tl.tax_amount) AS settlement_amount,
+    tl.executed_on,
+    tl.remarks
+FROM trade_ledger tl
+JOIN market_instruments mi
+  ON tl.instrument_uuid = mi.instrument_uuid;
+
+-- FUNCTIONS
+
+CREATE OR REPLACE FUNCTION fn_daily_returns(
+    p_instrument_uuid UUID,
+    p_limit_days INTEGER DEFAULT 30
+)
+RETURNS TABLE (
+    trading_day DATE,
+    closing_price NUMERIC,
+    previous_close NUMERIC,
+    return_ratio NUMERIC
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH ordered_prices AS (
+        SELECT
+            dmp.trading_day,
+            dmp.closing_price,
+            LAG(dmp.closing_price) OVER (ORDER BY dmp.trading_day) AS prev_close
+        FROM daily_market_prices dmp
+        WHERE dmp.instrument_uuid = p_instrument_uuid
+    ),
+    limited_prices AS (
+        SELECT *
+        FROM ordered_prices
+        ORDER BY trading_day DESC
+        LIMIT p_limit_days
+    )
+    SELECT
+        lp.trading_day,
+        lp.closing_price,
+        lp.prev_close,
+        CASE
+            WHEN lp.prev_close IS NOT NULL AND lp.prev_close > 0
+            THEN ROUND(((lp.closing_price - lp.prev_close) / lp.prev_close), 6)
+            ELSE NULL
+        END
+    FROM limited_prices lp
+    WHERE lp.prev_close IS NOT NULL
+    ORDER BY lp.trading_day ASC;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION fn_account_profitability(p_account_uuid UUID)
+RETURNS TABLE (
+    invested_amount NUMERIC,
+    market_value NUMERIC,
+    unrealized_profit NUMERIC,
+    unrealized_profit_pct NUMERIC
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        COALESCE(SUM(cp.units_held * cp.weighted_avg_cost), 0) AS invested_amount,
+        COALESCE(SUM(cp.units_held * COALESCE(cp.latest_market_price, 0)), 0) AS market_value,
+        COALESCE(SUM((cp.units_held * COALESCE(cp.latest_market_price, 0)) - (cp.units_held * cp.weighted_avg_cost)), 0) AS unrealized_profit,
+        CASE
+            WHEN COALESCE(SUM(cp.units_held * cp.weighted_avg_cost), 0) > 0
+            THEN ROUND(
+                (
+                    SUM((cp.units_held * COALESCE(cp.latest_market_price, 0)) - (cp.units_held * cp.weighted_avg_cost))
+                    / SUM(cp.units_held * cp.weighted_avg_cost)
+                ) * 100,
+                2
+            )
+            ELSE 0
+        END AS unrealized_profit_pct
+    FROM current_positions cp
+    WHERE cp.account_uuid = p_account_uuid;
+END;
+$$ LANGUAGE plpgsql;
