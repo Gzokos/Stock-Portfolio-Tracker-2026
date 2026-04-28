@@ -1,0 +1,28 @@
+# dependencies
+node_modules/
+package-lock.json
+yarn.lock
+
+# production
+dist/
+
+# environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# misc
+.eslintcache
